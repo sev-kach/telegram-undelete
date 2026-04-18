@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+*.session
+*.session-journal
+
+# Local data
+*.db
+*.log
+deleted_messages.html
+
+# Python
+__pycache__/
+*.pyc
