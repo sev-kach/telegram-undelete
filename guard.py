@@ -13,6 +13,7 @@
 
 import asyncio
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -100,6 +101,11 @@ def init_db():
 _extra_chat_ids = set()
 # Chat type cache: chat_id → type string
 _chat_type_cache = {}
+# Own account + notification-bot user IDs (set in main() once the client is logged in).
+# Used to suppress self-notification loops: skip saving the bot's own alert messages,
+# and skip sending a new alert when the original sender was you or the bot itself.
+_my_user_id = 0
+_bot_user_id = 0
 
 
 async def resolve_monitored_chats(client):
@@ -260,13 +266,19 @@ def mark_deleted(conn, chat_id: int, message_ids: list):
             """, (actual_chat_id or chat_id, chat_title, msg_id, sender_name, text, now))
             print(f"  DELETED: [{chat_title}] {sender_name}: {(text or '')[:100]}...")
 
-            # Private chats: sender_id == chat_id (positive number)
-            is_private = (actual_chat_id or 0) > 0
-            send_bot_alert(_format_alert(
-                "DELETED", chat_title, actual_chat_id or chat_id,
-                sender_name, sender_username or "", text,
-                sender_id=sender_id or 0, is_private=is_private,
-            ))
+            # Skip notification when the original sender was you or the notification
+            # bot itself — but keep the DB row so the HTML report stays accurate.
+            skip_notify = bool(sender_id) and (
+                sender_id == _my_user_id or sender_id == _bot_user_id
+            )
+            if not skip_notify:
+                # Private chats: sender_id == chat_id (positive number)
+                is_private = (actual_chat_id or 0) > 0
+                send_bot_alert(_format_alert(
+                    "DELETED", chat_title, actual_chat_id or chat_id,
+                    sender_name, sender_username or "", text,
+                    sender_id=sender_id or 0, is_private=is_private,
+                ))
 
     conn.commit()
 
@@ -303,13 +315,17 @@ def log_edit(conn, msg, chat_title: str, old_text: str):
     if msg.sender and hasattr(msg.sender, 'username') and msg.sender.username:
         sender_username = msg.sender.username
 
-    is_private = (msg.chat_id or 0) > 0
-    send_bot_alert(_format_alert(
-        "EDITED", chat_title, msg.chat_id,
-        sender_name, sender_username, new_text,
-        sender_id=msg.sender_id or 0,
-        old_text=old_text, is_private=is_private,
-    ))
+    skip_notify = bool(msg.sender_id) and (
+        msg.sender_id == _my_user_id or msg.sender_id == _bot_user_id
+    )
+    if not skip_notify:
+        is_private = (msg.chat_id or 0) > 0
+        send_bot_alert(_format_alert(
+            "EDITED", chat_title, msg.chat_id,
+            sender_name, sender_username, new_text,
+            sender_id=msg.sender_id or 0,
+            old_text=old_text, is_private=is_private,
+        ))
 
 
 def generate_html_report(conn):
@@ -431,6 +447,15 @@ async def main():
 
     me = await client.get_me()
     print(f"Logged in as: {me.first_name} ({me.phone})")
+
+    global _my_user_id, _bot_user_id
+    _my_user_id = me.id
+    if BOT_TOKEN and ":" in BOT_TOKEN:
+        try:
+            _bot_user_id = int(BOT_TOKEN.split(":", 1)[0])
+        except ValueError:
+            _bot_user_id = 0
+    print(f"Self-notify filter: my_id={_my_user_id}, bot_id={_bot_user_id}")
     print()
 
     await resolve_monitored_chats(client)
@@ -445,6 +470,10 @@ async def main():
     @client.on(events.NewMessage(incoming=True))
     async def on_new_message(event):
         if not is_monitored(event.chat_id, event):
+            return
+        # Ignore the notification bot's own alert messages — otherwise deletions of
+        # those alerts would trigger new alerts in a feedback loop.
+        if _bot_user_id and event.message.sender_id == _bot_user_id:
             return
         # Force-load sender entity (may be None if not cached)
         sender = await event.get_sender()
