@@ -239,6 +239,35 @@ def _format_alert(event_type: str, chat_title: str, chat_id: int,
     return "\n".join(parts)
 
 
+async def _text_or_refetch(client, msg, chat_id):
+    """Return (msg_to_save, text) or (None, '') if nothing recoverable.
+
+    When Telethon catches up after an MTProto sync failure, getDifference can
+    return Message stubs with an empty text field. Saving those produces
+    useless '(empty)' deletion notifications later. If the incoming object has
+    no text, we re-fetch the message from the server; if even that comes back
+    empty (media-only, TTL/view-once, or truly gone), we signal 'do not save'
+    so no empty row is ever written.
+    """
+    text = msg.text or msg.message or ""
+    if text:
+        return msg, text
+    try:
+        fresh = await client.get_messages(chat_id, ids=[msg.id])
+    except Exception as e:
+        log.warning(f"text re-fetch failed for msg {msg.id} in {chat_id}: {e}")
+        return None, ""
+    if not fresh:
+        return None, ""
+    fm = fresh[0] if isinstance(fresh, list) else fresh
+    if not fm:
+        return None, ""
+    text = fm.text or fm.message or ""
+    if not text:
+        return None, ""
+    return fm, text
+
+
 def mark_deleted(conn, chat_id: int, message_ids: list):
     """Mark messages as deleted, preserving the original text."""
     now = datetime.now(timezone.utc).isoformat()
@@ -475,21 +504,28 @@ async def main():
         # those alerts would trigger new alerts in a feedback loop.
         if _bot_user_id and event.message.sender_id == _bot_user_id:
             return
-        # Force-load sender entity (may be None if not cached)
+        msg, text = await _text_or_refetch(client, event.message, event.chat_id)
+        if msg is None:
+            log.info(f"SKIP SAVE (no recoverable text): id={event.message.id} chat={event.chat_id}")
+            return
         sender = await event.get_sender()
         title = chat_titles.get(event.chat_id, str(event.chat_id))
-        save_message(conn, event.message, title, sender=sender)
-        log.info(f"SAVED: [{title}] {event.message.sender_id}: {(event.message.text or '')[:80]}")
+        save_message(conn, msg, title, sender=sender)
+        log.info(f"SAVED: [{title}] {msg.sender_id}: {text[:80]}")
 
     # Also catch outgoing messages (your own)
     @client.on(events.NewMessage(outgoing=True))
     async def on_own_message(event):
         if not is_monitored(event.chat_id, event):
             return
+        msg, text = await _text_or_refetch(client, event.message, event.chat_id)
+        if msg is None:
+            log.info(f"SKIP SAVE own (no recoverable text): id={event.message.id} chat={event.chat_id}")
+            return
         sender = await event.get_sender()
         title = chat_titles.get(event.chat_id, str(event.chat_id))
-        save_message(conn, event.message, title, sender=sender)
-        log.info(f"SAVED (own): [{title}] {(event.message.text or '')[:80]}")
+        save_message(conn, msg, title, sender=sender)
+        log.info(f"SAVED (own): [{title}] {text[:80]}")
 
     # ─── Event: Message deleted ───
     if LOG_DELETED:
